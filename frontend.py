@@ -48,7 +48,11 @@ if uploaded_file is not None:
         with st.chat_message("assistant"):
             with st.spinner("Backend is thinking..."):
                 try:
-                    payload = {"question": prompt}
+                    # Send the question AND the chat history to the Flask API
+                    payload = {
+                        "question": prompt,
+                        "chat_history": st.session_state.messages
+                    }
                     response = requests.post(f"{API_URL}/chat", json=payload)
                     
                     if response.status_code == 200:
@@ -57,7 +61,14 @@ if uploaded_file is not None:
                         st.markdown(answer)
                         st.session_state.messages.append({"role": "assistant", "content": answer})
                     else:
-                        st.error(f"API Error: {response.json().get('error', 'Unknown error')}")
+                        # --- NEW ERROR HANDLING ---
+                        try:
+                            error_msg = response.json().get("error", "Unknown API error")
+                            st.error(f"API Error: {error_msg}")
+                        except requests.exceptions.JSONDecodeError:
+                            st.error(f"Backend Server Crashed! Check your Flask terminal for the exact error.")
+                        # --------------------------
+                        
                 except requests.exceptions.ConnectionError:
                     st.error("🚨 Lost connection to the backend server.")
 else:
