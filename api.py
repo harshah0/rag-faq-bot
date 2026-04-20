@@ -1,139 +1,126 @@
 import os
+from typing import Dict, Any
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
+
+# Search & Vector Libraries
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_classic.chains import create_retrieval_chain
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
-from langchain_core.prompts import MessagesPlaceholder
-from langchain_classic.chains import create_history_aware_retriever
+
+# AI & Orchestration
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_classic.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 
-# 1. Setup the Server
+# Initialize Environment and App
 load_dotenv()
 app = Flask(__name__)
-CORS(app) # Allows other apps (like your frontend) to talk to this API
+CORS(app)
 
-# Global variable to store our AI "Brain" in server memory
-global_rag_chain = None
+# Global singleton for the active RAG pipeline
+ACTIVE_ASSISTANT_PIPELINE = None
 
-
-# 2. Endpoint 1: Uploading the PDF
-@app.route('/upload', methods=['POST'])
-def upload_pdf():
-    global global_rag_chain
+@app.route('/api/v1/document/ingest', methods=['POST'])
+def process_document() -> tuple[Dict[str, str], int]:
+    """
+    Endpoint to ingest a PDF, chunk the text, and initialize a 
+    dual-retrieval (Dense + Sparse) hybrid search engine.
+    """
+    global ACTIVE_ASSISTANT_PIPELINE
     
-    # --- MISSING LINES RESTORED: Catch and save the uploaded file ---
     if 'file' not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
+        return jsonify({"error": "Missing payload: No PDF detected."}), 400
         
-    file = request.files['file']
-    file_path = "server_temp.pdf"
-    file.save(file_path)
-    # ----------------------------------------------------------------
+    uploaded_pdf = request.files['file']
+    temp_storage_path = "runtime_storage.pdf"
+    uploaded_pdf.save(temp_storage_path)
 
-    # --- YOUR UPGRADED LANGCHAIN CODE ---
-    loader = PyPDFLoader(file_path)
-    docs = loader.load()
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    chunks = text_splitter.split_documents(docs)
+    # 1. Document Extraction & Segmentation
+    doc_parser = PyPDFLoader(temp_storage_path)
+    extracted_pages = doc_parser.load()
     
-    # 1. Brain A: Semantic Search (Chroma Vectors)
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    vectorstore = Chroma.from_documents(documents=chunks, embedding=embeddings)
-    chroma_retriever = vectorstore.as_retriever(search_kwargs={"k": 3}) 
+    segmenter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    document_segments = segmenter.split_documents(extracted_pages)
     
-    # 2. Brain B: Keyword Search (BM25)
-    bm25_retriever = BM25Retriever.from_documents(chunks)
-    bm25_retriever.k = 3 
+    # 2. Semantic Search Initialization (ChromaDB)
+    hf_embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    semantic_db = Chroma.from_documents(documents=document_segments, embedding=hf_embedding_model)
+    semantic_fetcher = semantic_db.as_retriever(search_kwargs={"k": 3}) 
     
-    # 3. The Hybrid Engine: Combine them 50/50
-    ensemble_retriever = EnsembleRetriever(
-        retrievers=[bm25_retriever, chroma_retriever], 
+    # 3. Keyword Search Initialization (BM25)
+    keyword_fetcher = BM25Retriever.from_documents(document_segments)
+    keyword_fetcher.k = 3 
+    
+    # 4. Hybrid Search Aggregator
+    hybrid_engine = EnsembleRetriever(
+        retrievers=[keyword_fetcher, semantic_fetcher], 
         weights=[0.5, 0.5]
     )
     
-   # 4. Setup the AI
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
-    
-    # NEW: Prompt 1 - The Question Reformulator
-    contextualize_q_system_prompt = (
-        "Given a chat history and the latest user question "
-        "which might reference context in the chat history, "
-        "formulate a standalone question which can be understood "
-        "without the chat history. Do NOT answer the question, "
-        "just reformulate it if needed and otherwise return it as is."
-    )
-    contextualize_q_prompt = ChatPromptTemplate.from_messages([
-        ("system", contextualize_q_system_prompt),
+    # 5. Language Model Initialization
+    core_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
+
+    # Prompt: Final Answer Generation
+    answer_prompt_config = ChatPromptTemplate.from_messages([
+        ("system", (
+            "You are an expert analytical assistant. Utilize the provided context "
+            "to formulate a precise answer. If the context does not contain the answer, "
+            "state clearly that the information is unavailable. "
+            "Context: {context}"
+        )),
         MessagesPlaceholder("chat_history"),
         ("human", "{input}"),
     ])
     
-    # This creates the "Smart Searcher" that rewrites questions using history
-    history_aware_retriever = create_history_aware_retriever(
-        llm, ensemble_retriever, contextualize_q_prompt
-    )
+    document_chain = create_stuff_documents_chain(core_llm, answer_prompt_config)
+    
+   # Bind the final pipeline (Direct Hybrid Search)
+    ACTIVE_ASSISTANT_PIPELINE = create_retrieval_chain(hybrid_engine, document_chain)
+    return jsonify({"message": "Document successfully parsed and indexed."}), 200
 
-    # NEW: Prompt 2 - The Actual Answer Generator
-    system_prompt = (
-        "You are a helpful and friendly assistant. "
-        "Use the following pieces of retrieved context to answer the question. "
-        "If you don't know the answer, just say that you don't know. "
-        "Context: {context}"
-    )
-    qa_prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
-    ])
-    
-    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
-    
-    # Combine the Smart Searcher and the Answer Generator
-    global_rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-    
-    return jsonify({"message": "PDF successfully ingested and vectorized!"}), 200
 
-# 3. Endpoint 2: Asking Questions (Upgraded with Memory)
-@app.route('/chat', methods=['POST'])
-def chat():
-    global global_rag_chain
+@app.route('/api/v1/chat/query', methods=['POST'])
+def execute_query() -> tuple[Dict[str, Any], int]:
+    """
+    Endpoint to receive a user query and session history, routing it 
+    through the RAG pipeline to generate an AI response.
+    """
+    global ACTIVE_ASSISTANT_PIPELINE
     
-    if global_rag_chain is None:
-        return jsonify({"error": "Please upload a PDF to the /upload endpoint first."}), 400
+    if ACTIVE_ASSISTANT_PIPELINE is None:
+        return jsonify({"error": "Pipeline uninitialized. Upload a document first."}), 400
     
-    data = request.get_json()
-    user_question = data.get("question")
-    raw_history = data.get("chat_history", []) # Get history from frontend
+    request_payload = request.get_json()
+    user_query = request_payload.get("question")
+    session_history = request_payload.get("chat_history", [])
     
-    if not user_question:
-        return jsonify({"error": "No question provided in the JSON payload."}), 400
+    if not user_query:
+        return jsonify({"error": "Malformed request: Missing question payload."}), 400
 
-    # Convert Streamlit's history format into LangChain's strict Message Objects
-    formatted_history = []
-    for msg in raw_history:
-        if msg["role"] == "user":
-            formatted_history.append(HumanMessage(content=msg["content"]))
+    # Parse standard JSON history into LangChain Message schemas
+    parsed_history = []
+    for interaction in session_history:
+        if interaction.get("role") == "user":
+            parsed_history.append(HumanMessage(content=interaction.get("content")))
         else:
-            formatted_history.append(AIMessage(content=msg["content"]))
+            parsed_history.append(AIMessage(content=interaction.get("content")))
 
-    # Pass BOTH the input and the history to the chain
-    response = global_rag_chain.invoke({
-        "input": user_question,
-        "chat_history": formatted_history
+    # Execute RAG Pipeline
+    pipeline_result = ACTIVE_ASSISTANT_PIPELINE.invoke({
+        "input": user_query,
+        "chat_history": parsed_history
     })
     
-    return jsonify({"answer": response["answer"]}), 200
+    return jsonify({"answer": pipeline_result.get("answer", "No response generated.")}), 200
 
-# Run the server
+
 if __name__ == '__main__':
-    print("🚀 Starting Flask API Server on port 5000...")
+    print("Initializing Custom RAG Microservice on Port 5000...")
     app.run(debug=True, port=5000)

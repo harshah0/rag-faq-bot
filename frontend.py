@@ -1,75 +1,79 @@
 import streamlit as st
 import requests
 
-# The URL of your new Flask Backend
-API_URL = "http://127.0.0.1:5000"
+# Architecture Configuration
+BACKEND_SERVICE_URL = "http://127.0.0.1:5000"
+INGESTION_ENDPOINT = f"{BACKEND_SERVICE_URL}/api/v1/document/ingest"
+QUERY_ENDPOINT = f"{BACKEND_SERVICE_URL}/api/v1/chat/query"
 
-st.set_page_config(page_title="AI Resume Reader", page_icon="📄")
-st.title("📄 AI Document Reader")
-st.caption("Powered by a custom Flask + LangChain REST API")
+# UI Configuration
+st.set_page_config(page_title="Intelligent Document Engine", page_icon="🧠", layout="centered")
+st.title("🧠 Intelligent Document Engine")
+st.caption("Custom Microservice Architecture: Flask + LangChain + Streamlit")
 
-# 1. The File Uploader
-uploaded_file = st.file_uploader("Drop your PDF here", type="pdf")
+# Session State Initialization
+if "conversation_log" not in st.session_state:
+    st.session_state.conversation_log = []
+if "active_document" not in st.session_state:
+    st.session_state.active_document = None
 
-if uploaded_file is not None:
-    # We only want to upload the file to the backend once
-    if "current_file" not in st.session_state or st.session_state.current_file != uploaded_file.name:
-        with st.spinner("Sending PDF to the Backend Server for processing..."):
-            # Package the file and send it via HTTP POST
-            files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
+# --- SIDEBAR OR TOP WIDGET: File Upload ---
+uploaded_document = st.file_uploader("Upload a knowledge base (PDF format)", type="pdf")
+
+if uploaded_document is not None:
+    # Trigger ingestion only if it's a new file
+    if st.session_state.active_document != uploaded_document.name:
+        with st.spinner("Transmitting document to backend parsing engine..."):
+            
+            payload_files = {"file": (uploaded_document.name, uploaded_document.getvalue(), "application/pdf")}
+            
             try:
-                response = requests.post(f"{API_URL}/upload", files=files)
-                if response.status_code == 200:
-                    st.success("Backend successfully digested the PDF!")
-                    st.session_state.current_file = uploaded_file.name
-                    st.session_state.messages = [] # Clear chat history for the new file
+                ingest_response = requests.post(INGESTION_ENDPOINT, files=payload_files)
+                if ingest_response.status_code == 200:
+                    st.success("Backend processing complete. Ready for queries.")
+                    st.session_state.active_document = uploaded_document.name
+                    st.session_state.conversation_log = [] # Reset memory for new file
                 else:
-                    st.error(f"Backend error: {response.text}")
+                    st.error(f"Ingestion Failure: {ingest_response.text}")
             except requests.exceptions.ConnectionError:
-                st.error("🚨 Could not connect! Is your Flask backend server running?")
+                st.error("Fatal Error: Unable to establish connection with the Backend Microservice.")
 
-    # Setup Chat History
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+    # Render Chat History
+    for dialogue in st.session_state.conversation_log:
+        with st.chat_message(dialogue["role"]):
+            st.markdown(dialogue["content"])
 
-    # Display previous messages
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    # 2. The Chat Interface
-    if prompt := st.chat_input("Ask the backend a question about this document..."):
-        # Display user message instantly
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    # --- CHAT INPUT ---
+    user_input = st.chat_input("Enter your query regarding this document...")
+    
+    if user_input:
+        # Optimistically render user input
+        st.session_state.conversation_log.append({"role": "user", "content": user_input})
         with st.chat_message("user"):
-            st.markdown(prompt)
+            st.markdown(user_input)
 
-        # Send question to Flask API via JSON
+        # Transmit query to backend
         with st.chat_message("assistant"):
-            with st.spinner("Backend is thinking..."):
+            with st.spinner("Processing context and generating response..."):
                 try:
-                    # Send the question AND the chat history to the Flask API
-                    payload = {
-                        "question": prompt,
-                        "chat_history": st.session_state.messages
+                    query_payload = {
+                        "question": user_input,
+                        "chat_history": st.session_state.conversation_log
                     }
-                    response = requests.post(f"{API_URL}/chat", json=payload)
+                    api_response = requests.post(QUERY_ENDPOINT, json=query_payload)
                     
-                    if response.status_code == 200:
-                        # Extract the answer from the backend's JSON response
-                        answer = response.json().get("answer", "No answer found.")
-                        st.markdown(answer)
-                        st.session_state.messages.append({"role": "assistant", "content": answer})
+                    if api_response.status_code == 200:
+                        engine_output = api_response.json().get("answer", "System returned an empty response.")
+                        st.markdown(engine_output)
+                        st.session_state.conversation_log.append({"role": "assistant", "content": engine_output})
                     else:
-                        # --- NEW ERROR HANDLING ---
                         try:
-                            error_msg = response.json().get("error", "Unknown API error")
-                            st.error(f"API Error: {error_msg}")
+                            error_details = api_response.json().get("error", "Unknown processing error")
+                            st.error(f"Engine Error: {error_details}")
                         except requests.exceptions.JSONDecodeError:
-                            st.error(f"Backend Server Crashed! Check your Flask terminal for the exact error.")
-                        # --------------------------
-                        
+                            st.error("Critical Failure: The backend service crashed unexpectedly.")
+                            
                 except requests.exceptions.ConnectionError:
-                    st.error("🚨 Lost connection to the backend server.")
+                    st.error("Fatal Error: Connection to the RAG backend was lost.")
 else:
-    st.info("Please upload a PDF file to activate the chat.")
+    st.info("Awaiting document upload to initialize the context engine.")
