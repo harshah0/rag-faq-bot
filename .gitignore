@@ -1,0 +1,9 @@
+# Environments
+venv/
+__pycache__/
+
+# Secrets
+.env
+
+# Streamlit
+.streamlit/

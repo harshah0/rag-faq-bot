@@ -1,0 +1,3 @@
+"The college cafeteria is open from 7 AM to 9 PM. 
+"The wifi password for the library is 'BooksAreCool2026'.
+"The Dean of Computer Science is Dr. Alan Turing."
